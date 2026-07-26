@@ -26,3 +26,5 @@ Thumbs.db
 
 # Automation temporary files
 automation/reports/current-*
+
+automation/reports/validation-latest.txt
