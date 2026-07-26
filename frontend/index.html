@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>华南出行成本迷你计算器</title>
+    <meta
+      name="description"
+      content="比较广州、深圳、佛山和东莞之间的模拟出行成本"
+    >
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">TRAVEL COST PILOT</p>
+        <h1 id="page-title">华南出行成本<br>一眼算清</h1>
+        <p class="intro">
+          输入城市与同行人数，快速比较高铁、长途汽车和网约车的模拟价格与耗时。
+        </p>
+
+        <form id="compare-form" class="query-card">
+          <div class="field">
+            <label for="origin">出发城市</label>
+            <select id="origin" name="origin" required>
+              <option value="广州">广州</option>
+              <option value="深圳">深圳</option>
+              <option value="佛山">佛山</option>
+              <option value="东莞">东莞</option>
+            </select>
+          </div>
+
+          <div class="route-mark" aria-hidden="true">→</div>
+
+          <div class="field">
+            <label for="destination">目的城市</label>
+            <select id="destination" name="destination" required>
+              <option value="深圳">深圳</option>
+              <option value="广州">广州</option>
+              <option value="佛山">佛山</option>
+              <option value="东莞">东莞</option>
+            </select>
+          </div>
+
+          <div class="field passengers-field">
+            <label for="passengers">出行人数</label>
+            <select id="passengers" name="passengers" required>
+              <option value="1">1 人</option>
+              <option value="2" selected>2 人</option>
+              <option value="3">3 人</option>
+              <option value="4">4 人</option>
+            </select>
+          </div>
+
+          <button id="submit-button" type="submit">开始比较</button>
+        </form>
+
+        <p id="error-message" class="error-message" role="alert" hidden></p>
+      </section>
+
+      <section id="results-section" class="results-section" aria-live="polite" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">COMPARE</p>
+            <h2>方案对比</h2>
+          </div>
+          <p id="route-summary"></p>
+        </div>
+        <div id="results" class="results-grid"></div>
+        <p class="data-note">以上为项目内置模拟数据，仅供功能演示。</p>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
