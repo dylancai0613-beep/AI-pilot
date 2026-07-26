@@ -15,6 +15,7 @@ $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $ComposeFile = Join-Path $ProjectRoot "docker-compose.yml"
 $ReportDirectory = Join-Path $ProjectRoot "automation\reports"
 $ReportPath = Join-Path $ReportDirectory "validation-latest.txt"
+$BaseUrl = "http://localhost:8000"
 
 function Add-ReportLine {
     param([AllowEmptyString()][string]$Line)
@@ -84,6 +85,7 @@ function Invoke-Utf8HttpRequest {
     )
 
     $request = [System.Net.HttpWebRequest]::Create($Uri)
+    $request.Proxy = $null
     $request.Method = $Method
     $request.Accept = "application/json, text/html"
     $request.Timeout = 10000
@@ -270,11 +272,11 @@ try {
 
     Add-Section "9. Health endpoint"
     $script:CurrentStep = "Validate GET /health"
-    $script:CurrentCommand = "GET http://127.0.0.1:8000/health"
+    $script:CurrentCommand = "GET " + $BaseUrl + "/health"
     Add-ReportLine ("$ " + $script:CurrentCommand)
     $healthResponse = Invoke-Utf8HttpRequest `
         -Method "GET" `
-        -Uri "http://127.0.0.1:8000/health"
+        -Uri ($BaseUrl + "/health")
     Add-ReportLine ("HTTP status: " + $healthResponse.StatusCode)
     Add-ReportLine ("UTF-8 response: " + $healthResponse.Body)
     $healthPayload = $healthResponse.Body | ConvertFrom-Json
@@ -284,11 +286,11 @@ try {
 
     Add-Section "10. Homepage"
     $script:CurrentStep = "Validate GET /"
-    $script:CurrentCommand = "GET http://127.0.0.1:8000/"
+    $script:CurrentCommand = "GET " + $BaseUrl + "/"
     Add-ReportLine ("$ " + $script:CurrentCommand)
     $homeResponse = Invoke-Utf8HttpRequest `
         -Method "GET" `
-        -Uri "http://127.0.0.1:8000/"
+        -Uri ($BaseUrl + "/")
     Add-ReportLine ("HTTP status: " + $homeResponse.StatusCode)
     Add-ReportLine ("UTF-8 response length: " + $homeResponse.Body.Length)
     if ($homeResponse.StatusCode -ne 200) {
@@ -311,7 +313,7 @@ try {
 
     Add-Section "11-14. UTF-8 route comparison"
     $script:CurrentStep = "Validate Guangzhou to Shenzhen comparison for two passengers"
-    $script:CurrentCommand = "POST http://127.0.0.1:8000/api/compare"
+    $script:CurrentCommand = "POST " + $BaseUrl + "/api/compare"
 
     $guangzhou = "$([char]0x5E7F)$([char]0x5DDE)"
     $shenzhen = "$([char]0x6DF1)$([char]0x5733)"
@@ -329,7 +331,7 @@ try {
     Add-ReportLine ("UTF-8 request: " + $requestJson)
     $compareResponse = Invoke-Utf8HttpRequest `
         -Method "POST" `
-        -Uri "http://127.0.0.1:8000/api/compare" `
+        -Uri ($BaseUrl + "/api/compare") `
         -Body $requestJson
     Add-ReportLine ("HTTP status: " + $compareResponse.StatusCode)
     Add-ReportLine ("UTF-8 response: " + $compareResponse.Body)
