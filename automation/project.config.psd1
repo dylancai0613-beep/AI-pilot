@@ -1,20 +1,40 @@
 @{
     ProjectName = "Travel Cost Pilot"
 
-    Agent = @{
-        AdapterPath = "automation/adapters/agent/codex.ps1"
+    Agents = @{
+        Developer = @{
+            AdapterPath = "automation/adapters/agent/codex.ps1"
 
-        Runtime = @{
-            Name = "codex"
+            Runtime = @{
+                Name = "codex"
+            }
+
+            Model = @{
+                Name = $null
+                Reasoning = $null
+            }
+
+            Options = @{
+                Sandbox = "workspace-write"
+            }
         }
 
-        Model = @{
-            Name = $null
-            Reasoning = $null
-        }
+        Reviewer = @{
+            Enabled = $true
+            AdapterPath = "automation/adapters/agent/codex.ps1"
 
-        Options = @{
-            Sandbox = "workspace-write"
+            Runtime = @{
+                Name = "codex"
+            }
+
+            Model = @{
+                Name = $null
+                Reasoning = $null
+            }
+
+            Options = @{
+                Sandbox = "workspace-write"
+            }
         }
     }
 
@@ -35,5 +55,7 @@
 
     Defaults = @{
         MaxAttempts = 3
+        MaxReviewCycles = 2
+        MaxReviewerAttempts = 2
     }
 }

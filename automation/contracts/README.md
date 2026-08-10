@@ -34,8 +34,8 @@ The Core owns Request creation. Version 1 requires exactly these fields:
 
 `Runtime`, `Model`, and `Options` are opaque to the Core. The selected Adapter
 owns their semantics. `InvocationType` is an extensible non-empty string;
-current orchestration uses `development` and `repair`, while a future caller
-may use `review` without changing the Contract.
+current orchestration uses `development`, `repair`, and `review` without
+changing the Runtime boundary.
 
 ## Agent Result v1
 
@@ -85,5 +85,5 @@ An Agent Attempt is rejected when the Result is missing or invalid, schema or
 AttemptId differs, status is unsupported, exit codes differ, timestamps are
 invalid, Runtime or RequestedModel differs, an unsupported field is present,
 or the Adapter did not create both configured output files. An accepted Agent
-result never decides overall project success; independent Validation remains
-the final project gate.
+result never decides overall project success. Independent Validation, the
+optional Review Gate, and Cleanup determine the final outcome.

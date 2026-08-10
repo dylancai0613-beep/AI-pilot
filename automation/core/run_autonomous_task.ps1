@@ -21,6 +21,8 @@ $ErrorActionPreference = "Stop"
 $script:ReportLines = New-Object "System.Collections.Generic.List[string]"
 $script:AgentRecords = @()
 $script:ValidationRecords = @()
+$script:ReviewRecords = @()
+$script:AgentSequence = 0
 
 $ProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
 $ProjectRootPrefix = $ProjectRoot.TrimEnd([char[]]@("\", "/")) +
@@ -31,10 +33,12 @@ $ProjectName = "(not loaded)"
 $TaskFullPath = ""
 $TaskRelativePath = "(not resolved)"
 $AgentContractPath = ""
-$AgentAdapterPath = ""
-$AgentRuntime = $null
-$AgentModel = $null
-$AgentOptions = $null
+$ReviewContractPath = ""
+$ReviewGatePath = ""
+$DeveloperProfile = $null
+$ReviewerProfile = $null
+$ReviewerEnabled = $false
+$ReviewerResolvedModel = "null"
 $ValidationAdapterPath = ""
 $CleanupAdapterPath = ""
 $ValidationReportPath = ""
@@ -45,7 +49,9 @@ $InitialCommit = "(not recorded)"
 $InitialGitStatus = "(not recorded)"
 $FinalGitChanges = "(not recorded)"
 $WorkflowPassed = $false
-$ValidationPassed = $false
+$ValidationGateStatus = "NOT_RUN"
+$ReviewGateStatus = "NOT_RUN"
+$CleanupGateStatus = "NOT_RUN"
 $FailureReason = ""
 $CleanupConfigured = $false
 $CleanupEnabled = $false
@@ -54,6 +60,8 @@ $CleanupExitCode = $null
 $CleanupOutput = "(not attempted)"
 $ReportsEnabled = $false
 $EffectiveMaxAttempts = 0
+$EffectiveMaxReviewCycles = 0
+$EffectiveMaxReviewerAttempts = 0
 
 function Add-ReportLine {
     param([AllowEmptyString()][string]$Line)
@@ -180,6 +188,31 @@ function Get-RequiredSection {
     return [hashtable]$Configuration[$Name]
 }
 
+function Resolve-AgentProfile {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$ProfileConfig,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+
+    $adapterPath = Resolve-ProjectPath `
+        -CandidatePath (Get-RequiredString `
+            -Section $ProfileConfig `
+            -Name "AdapterPath" `
+            -Description ($Role + ".AdapterPath")) `
+        -Description ($Role + " Agent Adapter")
+    if (-not (Test-Path -LiteralPath $adapterPath -PathType Leaf)) {
+        throw ($Role + " Agent Adapter was not found: " + $adapterPath)
+    }
+
+    return [PSCustomObject]@{
+        Role = $Role
+        AdapterPath = $adapterPath
+        Runtime = Get-RequiredSection $ProfileConfig "Runtime"
+        Model = Get-RequiredSection $ProfileConfig "Model"
+        Options = Get-RequiredSection $ProfileConfig "Options"
+    }
+}
+
 function Invoke-GitReadCommand {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -211,6 +244,21 @@ function Get-GitChangeText {
         -Arguments @("status", "--short", "--untracked-files=all")
     if ($result.Lines.Count -eq 0) {
         return "(clean)"
+    }
+    return $result.Text
+}
+
+function Get-GitStableStatus {
+    $result = Invoke-GitReadCommand `
+        -Arguments @("status", "--porcelain=v1", "--untracked-files=all")
+    return $result.Text
+}
+
+function Get-GitDiffText {
+    $result = Invoke-GitReadCommand `
+        -Arguments @("diff", "--no-ext-diff", "--")
+    if ($result.Lines.Count -eq 0) {
+        return "(no tracked diff)"
     }
     return $result.Text
 }
@@ -254,7 +302,7 @@ function New-DevelopmentPrompt {
 "@
 }
 
-function New-RepairPrompt {
+function New-ValidationRepairPrompt {
     param(
         [Parameter(Mandatory = $true)][int]$RepairNumber,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ValidationReport,
@@ -285,13 +333,111 @@ $GitChanges
 "@
 }
 
+function New-ReviewPrompt {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReviewId,
+        [Parameter(Mandatory = $true)][string]$ReviewerAgentAttemptId,
+        [Parameter(Mandatory = $true)][string]$ReviewResultFile,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ValidationReport,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$GitChanges,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$GitDiff
+    )
+
+    return @"
+你是独立 Reviewer。你只执行 Review，不修改或修复项目代码。
+
+必须完整读取：
+1. AGENTS.md
+2. 原任务文件：$TaskRelativePath
+3. 当前 Git diff 与 Git 修改列表
+4. 当前 Validation Report
+5. 与修改直接相关的代码和测试
+
+只允许写入 Review Result 文件：$ReviewResultFile
+不得修改其他项目文件，不得删除文件，不得执行任何 Git 写操作；
+不得 add、commit、push、reset、restore、checkout、clean；
+不得改变 branch 或 HEAD，不得运行项目 Validation 或任何容器命令。
+Validation 通过不等于 Review Approved，Agent 的自然语言自述也不是质量证据。
+
+至少检查：
+1. 原任务是否真正完成；
+2. 是否超出允许修改范围；
+3. 是否存在明显 correctness bug；
+4. 是否存在安全或破坏性行为；
+5. 是否存在测试覆盖缺口；
+6. 是否存在与 Task 不一致的实现；
+7. 是否存在明显维护性问题；
+8. Validation 未覆盖的重要问题。
+
+必须将最终结论作为 UTF-8 JSON 写入指定文件，stdout 仅作为日志且不会参与 Gate。
+Review Result 必须严格使用 SchemaVersion 1：
+- ReviewId 必须为 "$ReviewId"；
+- ReviewerAgentAttemptId 必须为 "$ReviewerAgentAttemptId"；
+- Verdict 只能为 approved 或 changes_requested；
+- approved 不得包含 Blocking=true 的 Finding；
+- changes_requested 必须至少包含一个 Blocking=true 的 Finding；
+- Finding 字段必须为 Id、Severity、Blocking、Category、File、Line、Message、Evidence；
+- Severity 只能为 blocker、major、minor；
+- File 为 null 或项目内相对路径，Line 为 null 或正整数；
+- Evidence 必须是简洁的内联文本证据，不得依赖外部附件。
+
+===== Git 修改列表 =====
+$GitChanges
+
+===== 当前 Git diff =====
+$GitDiff
+
+===== Validation Report =====
+$ValidationReport
+"@
+}
+
+function New-ReviewRepairPrompt {
+    param(
+        [Parameter(Mandatory = $true)][int]$ReviewRepairCycle,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ValidationReport,
+        [Parameter(Mandatory = $true)][object]$ReviewResult,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$GitChanges
+    )
+
+    $reviewJson = $ReviewResult | ConvertTo-Json -Depth 32
+    $blockingFindings = @(
+        $ReviewResult.Findings | Where-Object { $_.Blocking -eq $true }
+    ) | ConvertTo-Json -Depth 32
+    return @"
+你是 Developer Agent，正在执行第 $ReviewRepairCycle 个 Review Repair Cycle。
+
+开始前必须完整读取 AGENTS.md、原任务文件 $TaskRelativePath 和相关代码。
+只修复下方有效 Review Result 中真实存在的 Blocking Findings。
+不得扩大原 Task 的修改范围，不得运行项目 Validation 或任何容器命令。
+不得执行任何 Git 写操作，不得 add、commit、push、reset、restore、checkout、clean；
+不得改变 branch 或 HEAD，不得提交代码。
+修复后总控会重新执行完整 Validation，再重新 Review。
+
+===== 最新 Validation Report =====
+$ValidationReport
+
+===== 完整 Review Result =====
+$reviewJson
+
+===== Blocking Findings =====
+$blockingFindings
+
+===== 当前 Git 修改列表 =====
+$GitChanges
+"@
+}
+
 function Invoke-AgentAttempt {
     param(
         [Parameter(Mandatory = $true)][int]$Attempt,
+        [Parameter(Mandatory = $true)][object]$AgentProfile,
+        [Parameter(Mandatory = $true)][string]$Role,
         [Parameter(Mandatory = $true)][string]$InvocationType,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt
     )
 
+    $agentAdapterPath = [string]$AgentProfile.AdapterPath
     $attemptText = "{0:D2}" -f $Attempt
     $attemptId = "agent-attempt-" + $attemptText
     $logPath = Join-Path $ReportDirectory `
@@ -334,9 +480,9 @@ function Invoke-AgentAttempt {
         PromptFile = $promptPath
         StdoutFile = $stdoutPath
         StderrFile = $stderrPath
-        Runtime = $AgentRuntime
-        Model = $AgentModel
-        Options = $AgentOptions
+        Runtime = $AgentProfile.Runtime
+        Model = $AgentProfile.Model
+        Options = $AgentProfile.Options
     }
     Write-AgentContractJson -LiteralPath $requestPath -InputObject $request
     $request = Read-AgentContractJson `
@@ -363,7 +509,7 @@ function Invoke-AgentAttempt {
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                ('"{0}"' -f $AgentAdapterPath),
+                ('"{0}"' -f $agentAdapterPath),
                 "-RequestFile",
                 ('"{0}"' -f $requestPath),
                 "-ResultFile",
@@ -443,8 +589,9 @@ function Invoke-AgentAttempt {
 
     $log = @"
 Agent attempt: $attemptText
+Role: $Role
 Invocation type: $InvocationType
-Adapter: $(Get-ProjectRelativePath -FullPath $AgentAdapterPath)
+Adapter: $(Get-ProjectRelativePath -FullPath $agentAdapterPath)
 Request file: $(Get-ProjectRelativePath -FullPath $requestPath)
 Result file: $(Get-ProjectRelativePath -FullPath $resultPath)
 Runtime: $runtimeText
@@ -490,6 +637,8 @@ $adapterStderrText
     return [PSCustomObject]@{
         Attempt = $Attempt
         AttemptId = $attemptId
+        Role = $Role
+        AdapterPath = Get-ProjectRelativePath -FullPath $agentAdapterPath
         InvocationType = $InvocationType
         Started = $resultStarted
         Finished = $resultFinished
@@ -505,6 +654,135 @@ $adapterStderrText
         RequestPath = Get-ProjectRelativePath -FullPath $requestPath
         ResultPath = Get-ProjectRelativePath -FullPath $resultPath
         LogPath = Get-ProjectRelativePath -FullPath $logPath
+    }
+}
+
+function Invoke-NextAgentAttempt {
+    param(
+        [Parameter(Mandatory = $true)][object]$AgentProfile,
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][string]$InvocationType,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt
+    )
+
+    $script:AgentSequence++
+    $record = Invoke-AgentAttempt `
+        -Attempt $script:AgentSequence `
+        -AgentProfile $AgentProfile `
+        -Role $Role `
+        -InvocationType $InvocationType `
+        -Prompt $Prompt
+    $script:AgentRecords += $record
+    return $record
+}
+
+function Invoke-ReviewerGateAttempt {
+    param(
+        [Parameter(Mandatory = $true)][int]$ReviewSequence,
+        [Parameter(Mandatory = $true)][int]$ReviewerTechnicalAttempt,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ValidationReport
+    )
+
+    $reviewId = "review-cycle-{0:D2}" -f $ReviewSequence
+    $reviewResultPath = Join-Path `
+        $ReportDirectory `
+        ("current-review-cycle-{0:D2}.result.json" -f $ReviewSequence)
+    Remove-TemporaryFile -Path $reviewResultPath
+
+    $nextAgentAttempt = $script:AgentSequence + 1
+    $expectedAgentAttemptId = "agent-attempt-{0:D2}" -f $nextAgentAttempt
+    $beforeStatus = Get-GitStableStatus
+    $prompt = New-ReviewPrompt `
+        -ReviewId $reviewId `
+        -ReviewerAgentAttemptId $expectedAgentAttemptId `
+        -ReviewResultFile $reviewResultPath `
+        -ValidationReport $ValidationReport `
+        -GitChanges (Get-GitChangeText) `
+        -GitDiff (Get-GitDiffText)
+
+    $agentRecord = Invoke-NextAgentAttempt `
+        -AgentProfile $ReviewerProfile `
+        -Role "Reviewer" `
+        -InvocationType "review" `
+        -Prompt $prompt
+    $afterStatus = Get-GitStableStatus
+    try {
+        Assert-GitIdentityUnchanged
+        [void](Assert-ReviewGitSnapshotUnchanged `
+            -Before $beforeStatus `
+            -After $afterStatus)
+    }
+    catch {
+        return [PSCustomObject]@{
+            TechnicalSucceeded = $false
+            Fatal = $true
+            FailureReason = $_.Exception.Message
+            Verdict = $null
+            ReviewResult = $null
+        }
+    }
+
+    if (-not $agentRecord.ContractValid) {
+        return [PSCustomObject]@{
+            TechnicalSucceeded = $false
+            Fatal = $false
+            FailureReason = (
+                "Reviewer Agent violated the Agent Contract: " +
+                $agentRecord.ContractError
+            )
+            Verdict = $null
+            ReviewResult = $null
+        }
+    }
+    if ($agentRecord.ExitCode -ne 0) {
+        return [PSCustomObject]@{
+            TechnicalSucceeded = $false
+            Fatal = $false
+            FailureReason = (
+                "Reviewer Agent returned exit code " + $agentRecord.ExitCode
+            )
+            Verdict = $null
+            ReviewResult = $null
+        }
+    }
+
+    try {
+        $reviewResult = Read-ReviewContractJson `
+            -LiteralPath $reviewResultPath `
+            -Description "Review Result"
+        $contractSummary = Assert-ReviewResultContract `
+            -Result $reviewResult `
+            -ExpectedReviewId $reviewId `
+            -ExpectedReviewerAgentAttemptId $agentRecord.AttemptId `
+            -ProjectRoot $ProjectRoot
+    }
+    catch {
+        return [PSCustomObject]@{
+            TechnicalSucceeded = $false
+            Fatal = $false
+            FailureReason = ("Review Contract violation: " + $_.Exception.Message)
+            Verdict = $null
+            ReviewResult = $null
+        }
+    }
+
+    $script:ReviewerResolvedModel = $agentRecord.ResolvedModel
+    $script:ReviewRecords += [PSCustomObject]@{
+        ReviewId = $reviewId
+        ReviewerAgentAttemptId = $agentRecord.AttemptId
+        ReviewerTechnicalAttempt = $ReviewerTechnicalAttempt
+        Verdict = $contractSummary.Verdict
+        Summary = [string]$reviewResult.Summary
+        BlockingFindingCount = $contractSummary.BlockingFindingCount
+        TotalFindingCount = $contractSummary.TotalFindingCount
+        ResultPath = Get-ProjectRelativePath -FullPath $reviewResultPath
+    }
+    return [PSCustomObject]@{
+        TechnicalSucceeded = $true
+        Fatal = $false
+        FailureReason = ""
+        Verdict = $contractSummary.Verdict
+        ReviewResult = $reviewResult
     }
 }
 
@@ -655,16 +933,44 @@ function Add-AutonomousReportContent {
     Add-ReportLine ("ProjectName: " + $ProjectName)
     Add-ReportLine ("Project root: " + $ProjectRoot)
     Add-ReportLine ("TaskFile: " + $TaskRelativePath)
-    Add-ReportLine ("Agent Adapter: " + (Get-ProjectRelativePath $AgentAdapterPath))
     Add-ReportLine (
-        "Runtime: " + (ConvertTo-AgentContractDisplayJson -Value $AgentRuntime)
+        "Developer Agent Adapter: " +
+        (Get-ProjectRelativePath $DeveloperProfile.AdapterPath)
     )
     Add-ReportLine (
-        "RequestedModel: " + (ConvertTo-AgentContractDisplayJson -Value $AgentModel)
+        "Developer Runtime: " +
+        (ConvertTo-AgentContractDisplayJson -Value $DeveloperProfile.Runtime)
     )
     Add-ReportLine (
-        "Agent Options: " + (ConvertTo-AgentContractDisplayJson -Value $AgentOptions)
+        "Developer Requested Model: " +
+        (ConvertTo-AgentContractDisplayJson -Value $DeveloperProfile.Model)
     )
+    Add-ReportLine (
+        "Developer Agent Options: " +
+        (ConvertTo-AgentContractDisplayJson -Value $DeveloperProfile.Options)
+    )
+    Add-ReportLine ("Reviewer Enabled: " + $ReviewerEnabled)
+    if ($ReviewerEnabled) {
+        Add-ReportLine (
+            "Reviewer Agent Adapter: " +
+            (Get-ProjectRelativePath $ReviewerProfile.AdapterPath)
+        )
+        Add-ReportLine (
+            "Reviewer Runtime: " +
+            (ConvertTo-AgentContractDisplayJson -Value $ReviewerProfile.Runtime)
+        )
+        Add-ReportLine (
+            "Reviewer Requested Model: " +
+            (ConvertTo-AgentContractDisplayJson -Value $ReviewerProfile.Model)
+        )
+        Add-ReportLine ("Reviewer Resolved Model: " + $ReviewerResolvedModel)
+    }
+    else {
+        Add-ReportLine "Reviewer Agent Adapter: (disabled)"
+        Add-ReportLine "Reviewer Runtime: (disabled)"
+        Add-ReportLine "Reviewer Requested Model: (disabled)"
+        Add-ReportLine "Reviewer Resolved Model: (disabled)"
+    }
     Add-ReportLine ("Validation Adapter: " + (Get-ProjectRelativePath $ValidationAdapterPath))
     if ($CleanupEnabled) {
         Add-ReportLine ("Cleanup Adapter: " + (Get-ProjectRelativePath $CleanupAdapterPath))
@@ -678,6 +984,8 @@ function Add-AutonomousReportContent {
     Add-ReportLine ("Started: " + (Format-Timestamp $StartTime))
     Add-ReportLine ("Finished: " + (Format-Timestamp $EndTime))
     Add-ReportLine ("MaxAttempts: " + $EffectiveMaxAttempts)
+    Add-ReportLine ("MaxReviewCycles: " + $EffectiveMaxReviewCycles)
+    Add-ReportLine ("MaxReviewerAttempts: " + $EffectiveMaxReviewerAttempts)
 
     Add-ReportLine ""
     Add-ReportLine "===== Agent attempts ====="
@@ -687,24 +995,53 @@ function Add-AutonomousReportContent {
     else {
         foreach ($record in $script:AgentRecords) {
             Add-ReportLine (
-                "Agent attempt {0:D2}: id={1}; type={2}; status={3}; " +
-                "started={4}; finished={5}; adapterProcessExitCode={6}; " +
-                "agentExitCode={7}; runtime={8}; requestedModel={9}; " +
-                "resolvedModel={10}; request={11}; result={12}; log={13}" -f `
+                "Agent attempt {0:D2}: id={1}; role={2}; type={3}; status={4}; " +
+                "started={5}; finished={6}; adapterProcessExitCode={7}; " +
+                "agentExitCode={8}; adapter={9}; runtime={10}; " +
+                "requestedModel={11}; resolvedModel={12}; request={13}; " +
+                "result={14}; log={15}" -f `
                     $record.Attempt,
                     $record.AttemptId,
+                    $record.Role,
                     $record.InvocationType,
                     $record.AdapterStatus,
                     $record.Started,
                     $record.Finished,
                     $record.AdapterProcessExitCode,
                     $record.ExitCode,
+                    $record.AdapterPath,
                     $record.Runtime,
                     $record.RequestedModel,
                     $record.ResolvedModel,
                     $record.RequestPath,
                     $record.ResultPath,
                     $record.LogPath
+            )
+        }
+    }
+
+    Add-ReportLine ""
+    Add-ReportLine "===== Review cycles ====="
+    if (-not $ReviewerEnabled) {
+        Add-ReportLine "Review Gate: DISABLED"
+    }
+    elseif ($script:ReviewRecords.Count -eq 0) {
+        Add-ReportLine "(none)"
+    }
+    else {
+        foreach ($record in $script:ReviewRecords) {
+            Add-ReportLine (
+                "ReviewId={0}; reviewerAgentAttempt={1}; technicalAttempt={2}; " +
+                "verdict={3}; summary={4}; blockingFindings={5}; " +
+                "totalFindings={6}; result={7}" -f `
+                    $record.ReviewId,
+                    $record.ReviewerAgentAttemptId,
+                    $record.ReviewerTechnicalAttempt,
+                    $record.Verdict,
+                    $record.Summary,
+                    $record.BlockingFindingCount,
+                    $record.TotalFindingCount,
+                    $record.ResultPath
             )
         }
     }
@@ -741,10 +1078,16 @@ function Add-AutonomousReportContent {
     Add-ReportLine ("Output: " + $CleanupOutput)
 
     Add-ReportLine ""
+    Add-ReportLine "===== Quality gates ====="
+    Add-ReportLine ("Validation Gate: " + $ValidationGateStatus)
+    Add-ReportLine ("Review Gate: " + $ReviewGateStatus)
+    Add-ReportLine ("Cleanup Gate: " + $CleanupGateStatus)
+
+    Add-ReportLine ""
     Add-ReportLine "===== Final conclusion ====="
     if ($WorkflowPassed) {
         Add-ReportLine "AUTONOMOUS TASK PASSED"
-        Add-ReportLine "The independent Validation Adapter returned exit code 0."
+        Add-ReportLine "All enabled quality gates passed."
     }
     else {
         Add-ReportLine "AUTONOMOUS TASK FAILED"
@@ -784,21 +1127,28 @@ try {
         -Section $configuration `
         -Name "ProjectName" `
         -Description "ProjectName"
-    $agentConfig = Get-RequiredSection $configuration "Agent"
-    $AgentRuntime = Get-RequiredSection $agentConfig "Runtime"
-    $AgentModel = Get-RequiredSection $agentConfig "Model"
-    $AgentOptions = Get-RequiredSection $agentConfig "Options"
+    $agentsConfig = Get-RequiredSection $configuration "Agents"
+    $developerConfig = Get-RequiredSection $agentsConfig "Developer"
+    $reviewerConfig = Get-RequiredSection $agentsConfig "Reviewer"
+    if (-not $reviewerConfig.ContainsKey("Enabled") -or
+        -not ($reviewerConfig.Enabled -is [bool])) {
+        throw "Agents.Reviewer.Enabled must be boolean."
+    }
+    $ReviewerEnabled = [bool]$reviewerConfig.Enabled
     $validationConfig = Get-RequiredSection $configuration "Validation"
     $cleanupConfig = Get-RequiredSection $configuration "Cleanup"
     $reportsConfig = Get-RequiredSection $configuration "Reports"
     $defaultsConfig = Get-RequiredSection $configuration "Defaults"
 
-    $AgentAdapterPath = Resolve-ProjectPath `
-        -CandidatePath (Get-RequiredString $agentConfig "AdapterPath" "Agent.AdapterPath") `
-        -Description "Agent Adapter"
     $AgentContractPath = Resolve-ProjectPath `
         -CandidatePath "automation\contracts\AgentContract.ps1" `
         -Description "Agent Contract"
+    $ReviewContractPath = Resolve-ProjectPath `
+        -CandidatePath "automation\contracts\ReviewContract.ps1" `
+        -Description "Review Contract"
+    $ReviewGatePath = Resolve-ProjectPath `
+        -CandidatePath "automation\core\ReviewGate.ps1" `
+        -Description "Review Gate"
     $ValidationAdapterPath = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $validationConfig "AdapterPath" "Validation.AdapterPath") `
         -Description "Validation Adapter"
@@ -824,15 +1174,29 @@ try {
     $CleanupConfigured = $true
     $ReportsEnabled = $true
 
-    if (-not (Test-Path -LiteralPath $AgentContractPath -PathType Leaf)) {
-        throw ("Agent Contract was not found: " + $AgentContractPath)
+    foreach ($requiredFrameworkFile in @(
+        $AgentContractPath,
+        $ReviewContractPath,
+        $ReviewGatePath
+    )) {
+        if (-not (Test-Path -LiteralPath $requiredFrameworkFile -PathType Leaf)) {
+            throw ("Required framework file was not found: " + $requiredFrameworkFile)
+        }
     }
     . $AgentContractPath
+    . $ReviewContractPath
+    . $ReviewGatePath
 
-    foreach ($adapterPath in @($AgentAdapterPath, $ValidationAdapterPath)) {
-        if (-not (Test-Path -LiteralPath $adapterPath -PathType Leaf)) {
-            throw ("Configured Adapter was not found: " + $adapterPath)
-        }
+    $DeveloperProfile = Resolve-AgentProfile `
+        -ProfileConfig $developerConfig `
+        -Role "Developer"
+    if ($ReviewerEnabled) {
+        $ReviewerProfile = Resolve-AgentProfile `
+            -ProfileConfig $reviewerConfig `
+            -Role "Reviewer"
+    }
+    if (-not (Test-Path -LiteralPath $ValidationAdapterPath -PathType Leaf)) {
+        throw ("Configured Adapter was not found: " + $ValidationAdapterPath)
     }
     if ($CleanupEnabled -and
         (-not (Test-Path -LiteralPath $CleanupAdapterPath -PathType Leaf))) {
@@ -864,6 +1228,21 @@ try {
     }
     if (($EffectiveMaxAttempts -lt 1) -or ($EffectiveMaxAttempts -gt 5)) {
         throw "MaxAttempts must be between 1 and 5."
+    }
+    foreach ($defaultName in @("MaxReviewCycles", "MaxReviewerAttempts")) {
+        if (-not $defaultsConfig.ContainsKey($defaultName)) {
+            throw ("Missing configuration value: Defaults." + $defaultName)
+        }
+    }
+    $EffectiveMaxReviewCycles = [int]$defaultsConfig.MaxReviewCycles
+    $EffectiveMaxReviewerAttempts = [int]$defaultsConfig.MaxReviewerAttempts
+    if (($EffectiveMaxReviewCycles -lt 0) -or
+        ($EffectiveMaxReviewCycles -gt 5)) {
+        throw "MaxReviewCycles must be between 0 and 5."
+    }
+    if (($EffectiveMaxReviewerAttempts -lt 1) -or
+        ($EffectiveMaxReviewerAttempts -gt 5)) {
+        throw "MaxReviewerAttempts must be between 1 and 5."
     }
 
     if ($null -eq (Get-Command "git" -ErrorAction SilentlyContinue)) {
@@ -898,91 +1277,117 @@ try {
 
     [void][System.IO.Directory]::CreateDirectory($ReportDirectory)
 
-    $nextInvocationType = "development"
-    $latestValidationReport = ""
-    $repairNumber = 0
+    $developerCallback = {
+        param($context)
 
-    for ($attempt = 1; $attempt -le $EffectiveMaxAttempts; $attempt++) {
-        if ($nextInvocationType -eq "development") {
-            $prompt = New-DevelopmentPrompt
-        }
-        else {
-            $repairNumber++
-            $prompt = New-RepairPrompt `
-                -RepairNumber $repairNumber `
-                -ValidationReport $latestValidationReport `
-                -GitChanges (Get-GitChangeText)
+        switch ([string]$context.Action) {
+            "development" {
+                $prompt = New-DevelopmentPrompt
+                $invocationType = "development"
+            }
+            "validation_repair" {
+                $prompt = New-ValidationRepairPrompt `
+                    -RepairNumber ([int]$context.DeveloperAttempt - 1) `
+                    -ValidationReport ([string]$context.ValidationReport) `
+                    -GitChanges (Get-GitChangeText)
+                $invocationType = "repair"
+            }
+            "review_repair" {
+                $prompt = New-ReviewRepairPrompt `
+                    -ReviewRepairCycle ([int]$context.ReviewRepairCycle) `
+                    -ValidationReport ([string]$context.ValidationReport) `
+                    -ReviewResult $context.ReviewResult `
+                    -GitChanges (Get-GitChangeText)
+                $invocationType = "repair"
+            }
+            default {
+                throw ("Unsupported Developer action: " + $context.Action)
+            }
         }
 
-        $agentRecord = Invoke-AgentAttempt `
-            -Attempt $attempt `
-            -InvocationType $nextInvocationType `
+        $agentRecord = Invoke-NextAgentAttempt `
+            -AgentProfile $DeveloperProfile `
+            -Role "Developer" `
+            -InvocationType $invocationType `
             -Prompt $prompt
-        $script:AgentRecords += $agentRecord
         Assert-GitIdentityUnchanged
-
         if (-not $agentRecord.ContractValid) {
-            $FailureReason = (
-                "Agent attempt {0:D2} violated the Agent Contract: {1}" -f `
-                    $attempt,
+            return [PSCustomObject]@{
+                Succeeded = $false
+                FailureReason = (
+                    "Developer Agent violated the Agent Contract: " +
                     $agentRecord.ContractError
-            )
-            continue
+                )
+            }
         }
-
         if ($agentRecord.ExitCode -ne 0) {
-            $FailureReason = (
-                "Agent attempt {0:D2} returned exit code {1}. " +
-                "Validation was not run for this attempt." -f `
-                    $attempt,
-                    $agentRecord.ExitCode
-            )
-            continue
+            return [PSCustomObject]@{
+                Succeeded = $false
+                FailureReason = (
+                    "Developer Agent returned exit code " + $agentRecord.ExitCode
+                )
+            }
         }
+        return [PSCustomObject]@{ Succeeded = $true; FailureReason = "" }
+    }
 
-        $validationResult = Invoke-ValidationAttempt -Attempt $attempt
+    $validationCallback = {
+        param($context)
+
+        $validationResult = Invoke-ValidationAttempt `
+            -Attempt ([int]$context.DeveloperAttempt)
         Assert-GitIdentityUnchanged
-        $snapshot = Save-ValidationSnapshot -Attempt $attempt
+        $snapshot = Save-ValidationSnapshot `
+            -Attempt ([int]$context.DeveloperAttempt)
         if ($validationResult.ExitCode -eq 0) {
             $resultText = "PASSED"
+            $failure = ""
         }
         else {
             $resultText = "FAILED"
+            $failure = (
+                "Validation attempt {0:D2} returned exit code {1}." -f `
+                    [int]$context.DeveloperAttempt,
+                    $validationResult.ExitCode
+            )
         }
         $script:ValidationRecords += [PSCustomObject]@{
-            Attempt = $attempt
+            Attempt = [int]$context.DeveloperAttempt
             Started = $validationResult.Started
             Finished = $validationResult.Finished
             ExitCode = [int]$validationResult.ExitCode
             Result = $resultText
             SnapshotPath = $snapshot.RelativePath
         }
-
-        if ($validationResult.ExitCode -eq 0) {
-            $ValidationPassed = $true
-            $WorkflowPassed = $true
-            $FailureReason = ""
-            break
-        }
-
-        $latestValidationReport = $snapshot.Text
-        $nextInvocationType = "repair"
-        $FailureReason = (
-            "Validation attempt {0:D2} returned exit code {1}." -f `
-                $attempt,
-                $validationResult.ExitCode
-        )
-    }
-
-    if (-not $ValidationPassed) {
-        $WorkflowPassed = $false
-        if ([string]::IsNullOrWhiteSpace($FailureReason)) {
-            $FailureReason = (
-                "The maximum number of Agent attempts was reached: " +
-                $EffectiveMaxAttempts
-            )
+        return [PSCustomObject]@{
+            Passed = ($validationResult.ExitCode -eq 0)
+            Report = $snapshot.Text
+            FailureReason = $failure
         }
     }
+
+    $reviewerCallback = {
+        param($context)
+
+        return Invoke-ReviewerGateAttempt `
+            -ReviewSequence ([int]$context.ReviewSequence) `
+            -ReviewerTechnicalAttempt ([int]$context.ReviewerTechnicalAttempt) `
+            -ValidationReport ([string]$context.ValidationReport)
+    }
+
+    $gateResult = Invoke-ReviewGateWorkflow `
+        -MaxDeveloperAttempts $EffectiveMaxAttempts `
+        -MaxReviewCycles $EffectiveMaxReviewCycles `
+        -MaxReviewerAttempts $EffectiveMaxReviewerAttempts `
+        -ReviewerEnabled $ReviewerEnabled `
+        -InvokeDeveloper $developerCallback `
+        -InvokeValidation $validationCallback `
+        -InvokeReviewer $reviewerCallback
+
+    $ValidationGateStatus = [string]$gateResult.ValidationGate
+    $ReviewGateStatus = [string]$gateResult.ReviewGate
+    $WorkflowPassed = [bool]$gateResult.Passed
+    $FailureReason = [string]$gateResult.FailureReason
 }
 catch {
     $WorkflowPassed = $false
@@ -999,15 +1404,20 @@ finally {
                 $CleanupExitCode = $cleanupResult.ExitCode
                 $CleanupOutput = $cleanupResult.Output
                 if ($CleanupExitCode -ne 0) {
+                    $CleanupGateStatus = "FAILED"
                     $WorkflowPassed = $false
                     Add-FailureReason (
                         "Cleanup Adapter returned exit code " + $CleanupExitCode
                     )
                 }
+                else {
+                    $CleanupGateStatus = "PASSED"
+                }
             }
             catch {
                 $CleanupExitCode = -1
                 $CleanupOutput = $_.Exception.Message
+                $CleanupGateStatus = "FAILED"
                 $WorkflowPassed = $false
                 Add-FailureReason ("Cleanup Adapter failed: " + $_.Exception.Message)
             }
@@ -1015,6 +1425,7 @@ finally {
         else {
             $CleanupExitCode = 0
             $CleanupOutput = "(disabled by Project Config)"
+            $CleanupGateStatus = "DISABLED"
         }
     }
 
