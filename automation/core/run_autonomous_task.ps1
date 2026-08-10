@@ -30,7 +30,11 @@ $EndTime = $null
 $ProjectName = "(not loaded)"
 $TaskFullPath = ""
 $TaskRelativePath = "(not resolved)"
+$AgentContractPath = ""
 $AgentAdapterPath = ""
+$AgentRuntime = $null
+$AgentModel = $null
+$AgentOptions = $null
 $ValidationAdapterPath = ""
 $CleanupAdapterPath = ""
 $ValidationReportPath = ""
@@ -289,24 +293,61 @@ function Invoke-AgentAttempt {
     )
 
     $attemptText = "{0:D2}" -f $Attempt
+    $attemptId = "agent-attempt-" + $attemptText
     $logPath = Join-Path $ReportDirectory `
         ("current-agent-attempt-{0}.log" -f $attemptText)
     $promptPath = Join-Path $ReportDirectory `
-        ("current-agent-attempt-{0}.prompt.tmp" -f $attemptText)
+        ("current-agent-attempt-{0}.prompt.txt" -f $attemptText)
     $stdoutPath = Join-Path $ReportDirectory `
-        ("current-agent-attempt-{0}.stdout.tmp" -f $attemptText)
+        ("current-agent-attempt-{0}.stdout.txt" -f $attemptText)
     $stderrPath = Join-Path $ReportDirectory `
-        ("current-agent-attempt-{0}.stderr.tmp" -f $attemptText)
+        ("current-agent-attempt-{0}.stderr.txt" -f $attemptText)
+    $requestPath = Join-Path $ReportDirectory `
+        ("current-agent-attempt-{0}.request.json" -f $attemptText)
+    $resultPath = Join-Path $ReportDirectory `
+        ("current-agent-attempt-{0}.result.json" -f $attemptText)
     $adapterStdoutPath = Join-Path $ReportDirectory `
         ("current-agent-attempt-{0}.adapter-stdout.tmp" -f $attemptText)
     $adapterStderrPath = Join-Path $ReportDirectory `
         ("current-agent-attempt-{0}.adapter-stderr.tmp" -f $attemptText)
 
+    foreach ($stalePath in @(
+        $logPath,
+        $promptPath,
+        $stdoutPath,
+        $stderrPath,
+        $requestPath,
+        $resultPath,
+        $adapterStdoutPath,
+        $adapterStderrPath
+    )) {
+        Remove-TemporaryFile -Path $stalePath
+    }
+
     Write-Utf8File -Path $promptPath -Content $Prompt
-    Write-Utf8File -Path $stdoutPath -Content ""
-    Write-Utf8File -Path $stderrPath -Content ""
+    $request = [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        AttemptId = $attemptId
+        InvocationType = $InvocationType
+        ProjectRoot = $ProjectRoot
+        TaskFile = $TaskFullPath
+        PromptFile = $promptPath
+        StdoutFile = $stdoutPath
+        StderrFile = $stderrPath
+        Runtime = $AgentRuntime
+        Model = $AgentModel
+        Options = $AgentOptions
+    }
+    Write-AgentContractJson -LiteralPath $requestPath -InputObject $request
+    $request = Read-AgentContractJson `
+        -LiteralPath $requestPath `
+        -Description "Agent Request"
+    [void](Assert-AgentRequestContract `
+        -Request $request `
+        -ExpectedProjectRoot $ProjectRoot)
+
     $started = Get-Date
-    $exitCode = -1
+    $adapterProcessExitCode = -1
     $startError = ""
 
     Write-Host ("Starting Agent attempt {0:D2} ({1})." -f `
@@ -323,14 +364,10 @@ function Invoke-AgentAttempt {
                 "Bypass",
                 "-File",
                 ('"{0}"' -f $AgentAdapterPath),
-                "-ProjectRoot",
-                ('"{0}"' -f $ProjectRoot),
-                "-PromptFile",
-                ('"{0}"' -f $promptPath),
-                "-StdoutFile",
-                ('"{0}"' -f $stdoutPath),
-                "-StderrFile",
-                ('"{0}"' -f $stderrPath)
+                "-RequestFile",
+                ('"{0}"' -f $requestPath),
+                "-ResultFile",
+                ('"{0}"' -f $resultPath)
             ) `
             -WorkingDirectory $ProjectRoot `
             -RedirectStandardOutput $adapterStdoutPath `
@@ -338,39 +375,89 @@ function Invoke-AgentAttempt {
             -NoNewWindow `
             -Wait `
             -PassThru
-        $exitCode = [int]$process.ExitCode
+        $adapterProcessExitCode = [int]$process.ExitCode
     }
     catch {
         $startError = $_.Exception.Message
     }
 
     $finished = Get-Date
-    $stdoutText = Read-TextFile -Path $stdoutPath
-    $stderrText = Read-TextFile -Path $stderrPath
-    foreach ($extraPath in @($adapterStdoutPath, $adapterStderrPath)) {
-        if (Test-Path -LiteralPath $extraPath -PathType Leaf) {
-            $extraText = Read-TextFile -Path $extraPath
-            if (-not [string]::IsNullOrWhiteSpace($extraText)) {
-                if ($extraPath -eq $adapterStdoutPath) {
-                    $stdoutText += [Environment]::NewLine + $extraText
-                }
-                else {
-                    $stderrText += [Environment]::NewLine + $extraText
-                }
-            }
+    $result = $null
+    $contractValid = $false
+    $contractError = ""
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($startError)) {
+            throw ("Agent Adapter failed to start: " + $startError)
         }
+        $result = Read-AgentContractJson `
+            -LiteralPath $resultPath `
+            -Description "Agent Result"
+        [void](Assert-AgentOutputFiles -Request $request)
+        [void](Assert-AgentResultContract `
+            -Result $result `
+            -Request $request `
+            -AdapterProcessExitCode $adapterProcessExitCode)
+        $contractValid = $true
     }
-    if (-not [string]::IsNullOrWhiteSpace($startError)) {
-        $stderrText += [Environment]::NewLine + "Adapter start error: " + $startError
+    catch {
+        $contractError = $_.Exception.Message
     }
+
+    $stdoutText = ""
+    $stderrText = ""
+    $adapterStdoutText = ""
+    $adapterStderrText = ""
+    if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+        $stdoutText = Read-TextFile -Path $stdoutPath
+    }
+    if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+        $stderrText = Read-TextFile -Path $stderrPath
+    }
+    if (Test-Path -LiteralPath $adapterStdoutPath -PathType Leaf) {
+        $adapterStdoutText = Read-TextFile -Path $adapterStdoutPath
+    }
+    if (Test-Path -LiteralPath $adapterStderrPath -PathType Leaf) {
+        $adapterStderrText = Read-TextFile -Path $adapterStderrPath
+    }
+
+    if ($contractValid) {
+        $adapterStatus = [string]$result.AdapterStatus
+        $agentExitCode = [int]$result.ExitCode
+        $resultStarted = [string]$result.StartedAt
+        $resultFinished = [string]$result.FinishedAt
+        $resolvedModel = $result.ResolvedModel
+        $message = [string]$result.Message
+    }
+    else {
+        $adapterStatus = "contract_violation"
+        $agentExitCode = -1
+        $resultStarted = Format-Timestamp -Value $started
+        $resultFinished = Format-Timestamp -Value $finished
+        $resolvedModel = $null
+        $message = $contractError
+    }
+
+    $runtimeText = ConvertTo-AgentContractDisplayJson -Value $request.Runtime
+    $requestedModelText = ConvertTo-AgentContractDisplayJson -Value $request.Model
+    $resolvedModelText = ConvertTo-AgentContractDisplayJson -Value $resolvedModel
 
     $log = @"
 Agent attempt: $attemptText
 Invocation type: $InvocationType
 Adapter: $(Get-ProjectRelativePath -FullPath $AgentAdapterPath)
-Started: $(Format-Timestamp -Value $started)
-Finished: $(Format-Timestamp -Value $finished)
-Exit code: $exitCode
+Request file: $(Get-ProjectRelativePath -FullPath $requestPath)
+Result file: $(Get-ProjectRelativePath -FullPath $resultPath)
+Runtime: $runtimeText
+Requested model: $requestedModelText
+Resolved model: $resolvedModelText
+Started: $resultStarted
+Finished: $resultFinished
+Adapter status: $adapterStatus
+Adapter process exit code: $adapterProcessExitCode
+Agent exit code: $agentExitCode
+Contract valid: $contractValid
+Contract error: $contractError
+Message: $message
 
 ===== PROMPT =====
 $Prompt
@@ -380,16 +467,16 @@ $stdoutText
 
 ===== STANDARD ERROR =====
 $stderrText
+
+===== ADAPTER PROCESS OUTPUT =====
+$adapterStdoutText
+
+===== ADAPTER PROCESS ERROR =====
+$adapterStderrText
 "@
     Write-Utf8File -Path $logPath -Content $log
 
-    foreach ($temporaryPath in @(
-        $promptPath,
-        $stdoutPath,
-        $stderrPath,
-        $adapterStdoutPath,
-        $adapterStderrPath
-    )) {
+    foreach ($temporaryPath in @($adapterStdoutPath, $adapterStderrPath)) {
         Remove-TemporaryFile -Path $temporaryPath
     }
 
@@ -402,10 +489,21 @@ $stderrText
 
     return [PSCustomObject]@{
         Attempt = $Attempt
+        AttemptId = $attemptId
         InvocationType = $InvocationType
-        Started = $started
-        Finished = $finished
-        ExitCode = [int]$exitCode
+        Started = $resultStarted
+        Finished = $resultFinished
+        AdapterProcessExitCode = [int]$adapterProcessExitCode
+        AdapterStatus = $adapterStatus
+        ExitCode = [int]$agentExitCode
+        ContractValid = $contractValid
+        ContractError = $contractError
+        Runtime = $runtimeText
+        RequestedModel = $requestedModelText
+        ResolvedModel = $resolvedModelText
+        Message = $message
+        RequestPath = Get-ProjectRelativePath -FullPath $requestPath
+        ResultPath = Get-ProjectRelativePath -FullPath $resultPath
         LogPath = Get-ProjectRelativePath -FullPath $logPath
     }
 }
@@ -558,6 +656,15 @@ function Add-AutonomousReportContent {
     Add-ReportLine ("Project root: " + $ProjectRoot)
     Add-ReportLine ("TaskFile: " + $TaskRelativePath)
     Add-ReportLine ("Agent Adapter: " + (Get-ProjectRelativePath $AgentAdapterPath))
+    Add-ReportLine (
+        "Runtime: " + (ConvertTo-AgentContractDisplayJson -Value $AgentRuntime)
+    )
+    Add-ReportLine (
+        "RequestedModel: " + (ConvertTo-AgentContractDisplayJson -Value $AgentModel)
+    )
+    Add-ReportLine (
+        "Agent Options: " + (ConvertTo-AgentContractDisplayJson -Value $AgentOptions)
+    )
     Add-ReportLine ("Validation Adapter: " + (Get-ProjectRelativePath $ValidationAdapterPath))
     if ($CleanupEnabled) {
         Add-ReportLine ("Cleanup Adapter: " + (Get-ProjectRelativePath $CleanupAdapterPath))
@@ -580,13 +687,23 @@ function Add-AutonomousReportContent {
     else {
         foreach ($record in $script:AgentRecords) {
             Add-ReportLine (
-                "Agent attempt {0:D2}: type={1}; started={2}; finished={3}; " +
-                "exitCode={4}; log={5}" -f `
+                "Agent attempt {0:D2}: id={1}; type={2}; status={3}; " +
+                "started={4}; finished={5}; adapterProcessExitCode={6}; " +
+                "agentExitCode={7}; runtime={8}; requestedModel={9}; " +
+                "resolvedModel={10}; request={11}; result={12}; log={13}" -f `
                     $record.Attempt,
+                    $record.AttemptId,
                     $record.InvocationType,
-                    (Format-Timestamp $record.Started),
-                    (Format-Timestamp $record.Finished),
+                    $record.AdapterStatus,
+                    $record.Started,
+                    $record.Finished,
+                    $record.AdapterProcessExitCode,
                     $record.ExitCode,
+                    $record.Runtime,
+                    $record.RequestedModel,
+                    $record.ResolvedModel,
+                    $record.RequestPath,
+                    $record.ResultPath,
                     $record.LogPath
             )
         }
@@ -668,6 +785,9 @@ try {
         -Name "ProjectName" `
         -Description "ProjectName"
     $agentConfig = Get-RequiredSection $configuration "Agent"
+    $AgentRuntime = Get-RequiredSection $agentConfig "Runtime"
+    $AgentModel = Get-RequiredSection $agentConfig "Model"
+    $AgentOptions = Get-RequiredSection $agentConfig "Options"
     $validationConfig = Get-RequiredSection $configuration "Validation"
     $cleanupConfig = Get-RequiredSection $configuration "Cleanup"
     $reportsConfig = Get-RequiredSection $configuration "Reports"
@@ -676,6 +796,9 @@ try {
     $AgentAdapterPath = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $agentConfig "AdapterPath" "Agent.AdapterPath") `
         -Description "Agent Adapter"
+    $AgentContractPath = Resolve-ProjectPath `
+        -CandidatePath "automation\contracts\AgentContract.ps1" `
+        -Description "Agent Contract"
     $ValidationAdapterPath = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $validationConfig "AdapterPath" "Validation.AdapterPath") `
         -Description "Validation Adapter"
@@ -700,6 +823,11 @@ try {
     }
     $CleanupConfigured = $true
     $ReportsEnabled = $true
+
+    if (-not (Test-Path -LiteralPath $AgentContractPath -PathType Leaf)) {
+        throw ("Agent Contract was not found: " + $AgentContractPath)
+    }
+    . $AgentContractPath
 
     foreach ($adapterPath in @($AgentAdapterPath, $ValidationAdapterPath)) {
         if (-not (Test-Path -LiteralPath $adapterPath -PathType Leaf)) {
@@ -770,12 +898,12 @@ try {
 
     [void][System.IO.Directory]::CreateDirectory($ReportDirectory)
 
-    $nextInvocationType = "开发"
+    $nextInvocationType = "development"
     $latestValidationReport = ""
     $repairNumber = 0
 
     for ($attempt = 1; $attempt -le $EffectiveMaxAttempts; $attempt++) {
-        if ($nextInvocationType -eq "开发") {
+        if ($nextInvocationType -eq "development") {
             $prompt = New-DevelopmentPrompt
         }
         else {
@@ -792,6 +920,15 @@ try {
             -Prompt $prompt
         $script:AgentRecords += $agentRecord
         Assert-GitIdentityUnchanged
+
+        if (-not $agentRecord.ContractValid) {
+            $FailureReason = (
+                "Agent attempt {0:D2} violated the Agent Contract: {1}" -f `
+                    $attempt,
+                    $agentRecord.ContractError
+            )
+            continue
+        }
 
         if ($agentRecord.ExitCode -ne 0) {
             $FailureReason = (
@@ -829,7 +966,7 @@ try {
         }
 
         $latestValidationReport = $snapshot.Text
-        $nextInvocationType = "修复"
+        $nextInvocationType = "repair"
         $FailureReason = (
             "Validation attempt {0:D2} returned exit code {1}." -f `
                 $attempt,

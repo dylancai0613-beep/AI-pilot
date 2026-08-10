@@ -3,6 +3,19 @@
 
     Agent = @{
         AdapterPath = "automation/adapters/agent/codex.ps1"
+
+        Runtime = @{
+            Name = "codex"
+        }
+
+        Model = @{
+            Name = $null
+            Reasoning = $null
+        }
+
+        Options = @{
+            Sandbox = "workspace-write"
+        }
     }
 
     Validation = @{
