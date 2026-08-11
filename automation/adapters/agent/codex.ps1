@@ -125,6 +125,12 @@ try {
         )
     }
 
+    $nativeRuntime = @(Get-Command "codex.exe" -All -ErrorAction SilentlyContinue) |
+        Where-Object {
+            $_.CommandType -eq "Application" -and
+            (Test-Path -LiteralPath $_.Source -PathType Leaf)
+        } |
+        Select-Object -First 1
     $runtimeCommands = @(Get-Command "codex" -All -ErrorAction SilentlyContinue)
     $runtimeScript = $runtimeCommands |
         Where-Object {
@@ -133,28 +139,36 @@ try {
             (Test-Path -LiteralPath $_.Source -PathType Leaf)
         } |
         Select-Object -First 1
-    if ($null -eq $runtimeScript) {
+    if ($null -eq $nativeRuntime -and $null -eq $runtimeScript) {
         $adapterStatus = "failed_to_start"
         $exitCode = 127
-        $message = "The Codex PowerShell launcher was not found."
+        $message = "The Codex executable or PowerShell launcher was not found."
     }
     else {
-        $hostCommand = Get-Command "powershell.exe" -ErrorAction Stop
+        if ($null -ne $nativeRuntime) {
+            $runtimeFile = [System.IO.Path]::GetFullPath($nativeRuntime.Source)
+            $runtimeArguments = @("exec", "--sandbox", $sandbox, "-")
+        }
+        else {
+            $hostCommand = Get-Command "powershell.exe" -ErrorAction Stop
+            $runtimeFile = $hostCommand.Source
+            $runtimeArguments = @(
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                ('"{0}"' -f ([System.IO.Path]::GetFullPath($runtimeScript.Source))),
+                "exec",
+                "--sandbox",
+                $sandbox,
+                "-"
+            )
+        }
         try {
             $process = Start-Process `
-                -FilePath $hostCommand.Source `
-                -ArgumentList @(
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    ('"{0}"' -f ([System.IO.Path]::GetFullPath($runtimeScript.Source))),
-                    "exec",
-                    "--sandbox",
-                    $sandbox,
-                    "-"
-                ) `
+                -FilePath $runtimeFile `
+                -ArgumentList $runtimeArguments `
                 -WorkingDirectory $projectRoot `
                 -RedirectStandardInput ([string]$request.PromptFile) `
                 -RedirectStandardOutput ([string]$request.StdoutFile) `
