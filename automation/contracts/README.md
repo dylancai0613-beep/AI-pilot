@@ -87,3 +87,10 @@ invalid, Runtime or RequestedModel differs, an unsupported field is present,
 or the Adapter did not create both configured output files. An accepted Agent
 result never decides overall project success. Independent Validation, the
 optional Review Gate, and Cleanup determine the final outcome.
+
+## Persistent Run contracts
+
+`RunStateContract.ps1` defines the authoritative versioned Run snapshot.
+`TrajectoryContract.ps1` defines the append-only JSONL audit boundary. These
+contracts are separate from Agent execution and Review verdict contracts, so
+checkpoint/resume does not add Runtime or project semantics to either layer.

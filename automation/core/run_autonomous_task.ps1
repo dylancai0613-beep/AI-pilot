@@ -8,10 +8,15 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ConfigFile,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = "New")]
     [ValidateNotNullOrEmpty()]
     [string]$TaskFile,
 
+    [Parameter(Mandatory = $true, ParameterSetName = "Resume")]
+    [ValidateNotNullOrEmpty()]
+    [string]$ResumeRunId,
+
+    [Parameter(ParameterSetName = "New")]
     [int]$MaxAttempts
 )
 
@@ -35,6 +40,11 @@ $TaskRelativePath = "(not resolved)"
 $AgentContractPath = ""
 $ReviewContractPath = ""
 $ReviewGatePath = ""
+$RunStateContractPath = ""
+$TrajectoryContractPath = ""
+$WorkspaceFingerprintPath = ""
+$RunStateModulePath = ""
+$PersistentWorkflowPath = ""
 $DeveloperProfile = $null
 $ReviewerProfile = $null
 $ReviewerEnabled = $false
@@ -43,7 +53,17 @@ $ValidationAdapterPath = ""
 $CleanupAdapterPath = ""
 $ValidationReportPath = ""
 $ReportDirectory = ""
+$LatestReportDirectory = ""
 $AutonomousReportPath = ""
+$RunsDirectory = ""
+$RunDirectory = ""
+$RunArtifactsDirectory = ""
+$RunStatePath = ""
+$TrajectoryPath = ""
+$RunSummaryPath = ""
+$RunId = "(not created)"
+$RunState = $null
+$RunContext = $null
 $InitialBranch = "(not recorded)"
 $InitialCommit = "(not recorded)"
 $InitialGitStatus = "(not recorded)"
@@ -103,6 +123,48 @@ function Read-TextFile {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     return [System.IO.File]::ReadAllText($Path)
+}
+
+function Convert-ProjectArtifactToRunRelative {
+    param([Parameter(Mandatory = $true)][string]$ProjectRelativePath)
+    $full = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $ProjectRelativePath))
+    return Get-RunRelativePath $RunDirectory $full
+}
+
+function Read-RunArtifactText {
+    param([AllowNull()][object]$RelativePath)
+    if ($null -eq $RelativePath -or
+        [string]::IsNullOrWhiteSpace([string]$RelativePath)) {
+        return ""
+    }
+    $full = [System.IO.Path]::GetFullPath(
+        (Join-Path $RunDirectory ([string]$RelativePath))
+    )
+    [void](Get-RunRelativePath $RunDirectory $full)
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        throw ("Run artifact was not found: " + $RelativePath)
+    }
+    return Read-TextFile $full
+}
+
+function Add-InterruptedContinuationInstructions {
+    param(
+        [Parameter(Mandatory = $true)][string]$Prompt,
+        [AllowNull()][object]$InterruptedStage,
+        [bool]$WorkspaceChanged
+    )
+    if ($null -eq $InterruptedStage -or
+        [string]$InterruptedStage -notin @("development", "repair")) {
+        return $Prompt
+    }
+    return @"
+上一次 Developer Agent attempt 在执行中被中断。
+当前 workspace 可能包含 partial changes：$WorkspaceChanged。
+先检查当前 Git diff，在现有修改基础上继续完成原任务；
+不得假设上一次 attempt 已完成，也不得丢弃或自动恢复现有修改。
+
+$Prompt
+"@
 }
 
 function Remove-TemporaryFile {
@@ -217,9 +279,15 @@ function Invoke-GitReadCommand {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
     $LASTEXITCODE = 0
-    $outputLines = @(
-        & git @Arguments 2>&1 | ForEach-Object { $_.ToString() }
-    )
+    $previousErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $outputLines = @(
+            & git -c core.safecrlf=false @Arguments 2>&1 |
+                ForEach-Object { $_.ToString() }
+        )
+    }
+    finally { $ErrorActionPreference = $previousErrorPreference }
     $commandExitCode = $LASTEXITCODE
     if ($null -eq $commandExitCode) {
         $commandExitCode = 0
@@ -650,7 +718,11 @@ $adapterStderrText
         Runtime = $runtimeText
         RequestedModel = $requestedModelText
         ResolvedModel = $resolvedModelText
+        ResolvedModelValue = $resolvedModel
         Message = $message
+        PromptPath = Get-ProjectRelativePath -FullPath $promptPath
+        StdoutPath = Get-ProjectRelativePath -FullPath $stdoutPath
+        StderrPath = Get-ProjectRelativePath -FullPath $stderrPath
         RequestPath = Get-ProjectRelativePath -FullPath $requestPath
         ResultPath = Get-ProjectRelativePath -FullPath $resultPath
         LogPath = Get-ProjectRelativePath -FullPath $logPath
@@ -930,6 +1002,9 @@ function Invoke-CleanupAdapter {
 
 function Add-AutonomousReportContent {
     Add-ReportLine ($ProjectName + " - Autonomous Task Report")
+    Add-ReportLine ("RunId: " + $RunId)
+    Add-ReportLine ("Authoritative State: " + (Get-ProjectRelativePath $RunStatePath))
+    Add-ReportLine ("Trajectory: " + (Get-ProjectRelativePath $TrajectoryPath))
     Add-ReportLine ("ProjectName: " + $ProjectName)
     Add-ReportLine ("Project root: " + $ProjectRoot)
     Add-ReportLine ("TaskFile: " + $TaskRelativePath)
@@ -986,6 +1061,12 @@ function Add-AutonomousReportContent {
     Add-ReportLine ("MaxAttempts: " + $EffectiveMaxAttempts)
     Add-ReportLine ("MaxReviewCycles: " + $EffectiveMaxReviewCycles)
     Add-ReportLine ("MaxReviewerAttempts: " + $EffectiveMaxReviewerAttempts)
+    if ($null -ne $RunState) {
+        Add-ReportLine ("DeveloperAttempts: " + $RunState.Counters.DeveloperAttempts)
+        Add-ReportLine ("ValidationAttempts: " + $RunState.Counters.ValidationAttempts)
+        Add-ReportLine ("ReviewerAttempts: " + $RunState.Counters.ReviewerAttempts)
+        Add-ReportLine ("ReviewCycles: " + $RunState.Counters.ReviewCycles)
+    }
 
     Add-ReportLine ""
     Add-ReportLine "===== Agent attempts ====="
@@ -1099,6 +1180,40 @@ function Add-AutonomousReportContent {
     Add-ReportLine "A human must inspect the Git diff."
 }
 
+function Write-RunSummary {
+    if ($null -eq $RunState -or
+        [string]$RunState.Status -notin @("completed", "failed")) {
+        return
+    }
+    $created = [DateTimeOffset]::Parse([string]$RunState.CreatedAt)
+    $finished = [DateTimeOffset]::Parse([string]$RunState.UpdatedAt)
+    $duration = [math]::Max(0, [int64]($finished - $created).TotalSeconds)
+    $failureText = ""
+    if ($null -ne $RunState.Failure) {
+        $failureText = [string]$RunState.Failure.Message
+    }
+    $summary = @"
+RunId: $RunId
+Project: $ProjectName
+Task: $TaskRelativePath
+StartedAt: $($RunState.CreatedAt)
+FinishedAt: $($RunState.UpdatedAt)
+DurationSeconds: $duration
+FinalStatus: $($RunState.Status)
+DeveloperAttempts: $($RunState.Counters.DeveloperAttempts)
+ValidationAttempts: $($RunState.Counters.ValidationAttempts)
+ReviewerAttempts: $($RunState.Counters.ReviewerAttempts)
+ReviewCycles: $($RunState.Counters.ReviewCycles)
+ValidationGate: $($RunState.Gates.Validation)
+ReviewGate: $($RunState.Gates.Review)
+CleanupGate: $($RunState.Gates.Cleanup)
+FinalGitChanges: $FinalGitChanges
+FailureReason: $failureText
+TrajectoryPath: $(Get-ProjectRelativePath $TrajectoryPath)
+"@
+    Write-Utf8File -Path $RunSummaryPath -Content $summary
+}
+
 try {
     if (-not (Test-Path -LiteralPath $ProjectRoot -PathType Container)) {
         throw ("Project root was not found: " + $ProjectRoot)
@@ -1138,6 +1253,7 @@ try {
     $validationConfig = Get-RequiredSection $configuration "Validation"
     $cleanupConfig = Get-RequiredSection $configuration "Cleanup"
     $reportsConfig = Get-RequiredSection $configuration "Reports"
+    $runsConfig = Get-RequiredSection $configuration "Runs"
     $defaultsConfig = Get-RequiredSection $configuration "Defaults"
 
     $AgentContractPath = Resolve-ProjectPath `
@@ -1149,18 +1265,36 @@ try {
     $ReviewGatePath = Resolve-ProjectPath `
         -CandidatePath "automation\core\ReviewGate.ps1" `
         -Description "Review Gate"
+    $RunStateContractPath = Resolve-ProjectPath `
+        -CandidatePath "automation\contracts\RunStateContract.ps1" `
+        -Description "Run State Contract"
+    $TrajectoryContractPath = Resolve-ProjectPath `
+        -CandidatePath "automation\contracts\TrajectoryContract.ps1" `
+        -Description "Trajectory Contract"
+    $WorkspaceFingerprintPath = Resolve-ProjectPath `
+        -CandidatePath "automation\core\WorkspaceFingerprint.ps1" `
+        -Description "Workspace Fingerprint"
+    $RunStateModulePath = Resolve-ProjectPath `
+        -CandidatePath "automation\core\RunState.ps1" `
+        -Description "Run State module"
+    $PersistentWorkflowPath = Resolve-ProjectPath `
+        -CandidatePath "automation\core\PersistentWorkflow.ps1" `
+        -Description "Persistent Workflow"
     $ValidationAdapterPath = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $validationConfig "AdapterPath" "Validation.AdapterPath") `
         -Description "Validation Adapter"
     $ValidationReportPath = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $validationConfig "ReportPath" "Validation.ReportPath") `
         -Description "Validation Report"
-    $ReportDirectory = Resolve-ProjectPath `
+    $LatestReportDirectory = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $reportsConfig "Directory" "Reports.Directory") `
         -Description "Reports Directory"
     $AutonomousReportPath = Resolve-ProjectPath `
         -CandidatePath (Get-RequiredString $reportsConfig "AutonomousLatest" "Reports.AutonomousLatest") `
         -Description "Autonomous Report"
+    $RunsDirectory = Resolve-ProjectPath `
+        -CandidatePath (Get-RequiredString $runsConfig "Directory" "Runs.Directory") `
+        -Description "Runs Directory"
 
     if (-not $cleanupConfig.ContainsKey("Enabled")) {
         throw "Missing configuration value: Cleanup.Enabled"
@@ -1177,7 +1311,12 @@ try {
     foreach ($requiredFrameworkFile in @(
         $AgentContractPath,
         $ReviewContractPath,
-        $ReviewGatePath
+        $ReviewGatePath,
+        $RunStateContractPath,
+        $TrajectoryContractPath,
+        $WorkspaceFingerprintPath,
+        $RunStateModulePath,
+        $PersistentWorkflowPath
     )) {
         if (-not (Test-Path -LiteralPath $requiredFrameworkFile -PathType Leaf)) {
             throw ("Required framework file was not found: " + $requiredFrameworkFile)
@@ -1186,6 +1325,11 @@ try {
     . $AgentContractPath
     . $ReviewContractPath
     . $ReviewGatePath
+    . $RunStateContractPath
+    . $TrajectoryContractPath
+    . $WorkspaceFingerprintPath
+    . $RunStateModulePath
+    . $PersistentWorkflowPath
 
     $DeveloperProfile = Resolve-AgentProfile `
         -ProfileConfig $developerConfig `
@@ -1209,6 +1353,27 @@ try {
         throw ("Agent instructions were not found: " + $agentsFile)
     }
 
+    if ($PSCmdlet.ParameterSetName -eq "Resume") {
+        if (-not ($ResumeRunId -match
+            "\Arun-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\z")) {
+            throw "RunId has an unsupported or unsafe format."
+        }
+        $RunId = $ResumeRunId
+        $RunDirectory = Resolve-ProjectPath `
+            -CandidatePath (Join-Path $RunsDirectory $RunId) `
+            -Description "Run Directory"
+        if (-not (Test-Path -LiteralPath $RunDirectory -PathType Container)) {
+            throw ("RUN_NOT_FOUND: " + $RunId)
+        }
+        $RunStatePath = Join-Path $RunDirectory "state.json"
+        $TrajectoryPath = Join-Path $RunDirectory "trajectory.jsonl"
+        $RunSummaryPath = Join-Path $RunDirectory "summary.txt"
+        $RunArtifactsDirectory = Join-Path $RunDirectory "artifacts"
+        $statePreview = Read-RunStateJson $RunStatePath "Run State"
+        [void](Assert-RunStateContract $statePreview $ProjectRoot $RunId)
+        $TaskFile = [string]$statePreview.Task.Path
+    }
+
     $TaskFullPath = Resolve-ProjectPath `
         -CandidatePath $TaskFile `
         -Description "TaskFile"
@@ -1217,7 +1382,12 @@ try {
     }
     $TaskRelativePath = Get-ProjectRelativePath $TaskFullPath
 
-    if ($PSBoundParameters.ContainsKey("MaxAttempts")) {
+    if ($PSCmdlet.ParameterSetName -eq "Resume") {
+        $EffectiveMaxAttempts = [int]$statePreview.EffectiveLimits.MaxAttempts
+        $EffectiveMaxReviewCycles = [int]$statePreview.EffectiveLimits.MaxReviewCycles
+        $EffectiveMaxReviewerAttempts = [int]$statePreview.EffectiveLimits.MaxReviewerAttempts
+    }
+    elseif ($PSBoundParameters.ContainsKey("MaxAttempts")) {
         $EffectiveMaxAttempts = $MaxAttempts
     }
     else {
@@ -1234,8 +1404,10 @@ try {
             throw ("Missing configuration value: Defaults." + $defaultName)
         }
     }
-    $EffectiveMaxReviewCycles = [int]$defaultsConfig.MaxReviewCycles
-    $EffectiveMaxReviewerAttempts = [int]$defaultsConfig.MaxReviewerAttempts
+    if ($PSCmdlet.ParameterSetName -ne "Resume") {
+        $EffectiveMaxReviewCycles = [int]$defaultsConfig.MaxReviewCycles
+        $EffectiveMaxReviewerAttempts = [int]$defaultsConfig.MaxReviewerAttempts
+    }
     if (($EffectiveMaxReviewCycles -lt 0) -or
         ($EffectiveMaxReviewCycles -gt 5)) {
         throw "MaxReviewCycles must be between 0 and 5."
@@ -1267,7 +1439,8 @@ try {
     $InitialCommit = (Invoke-GitReadCommand `
         @("rev-parse", "HEAD")).Text.Trim()
     $InitialGitStatus = Get-GitChangeText
-    if ($InitialGitStatus -ne "(clean)") {
+    if ($PSCmdlet.ParameterSetName -eq "New" -and
+        $InitialGitStatus -ne "(clean)") {
         throw (
             "The initial Git working tree is not clean. " +
             "No Agent process will be started. Changes:" +
@@ -1275,119 +1448,238 @@ try {
         )
     }
 
-    [void][System.IO.Directory]::CreateDirectory($ReportDirectory)
+    $fingerprintExclusions = @(
+        (Get-ProjectRelativePath $RunsDirectory),
+        (Get-ProjectRelativePath $LatestReportDirectory)
+    )
+    $getFingerprint = {
+        Get-WorkspaceFingerprint `
+            -ProjectRoot $ProjectRoot `
+            -ExcludeRelativePrefixes $fingerprintExclusions
+    }
 
-    $developerCallback = {
+    if ($PSCmdlet.ParameterSetName -eq "New") {
+        [void][System.IO.Directory]::CreateDirectory($RunsDirectory)
+        do {
+            $RunId = New-RunId
+            $RunDirectory = Join-Path $RunsDirectory $RunId
+        } while (Test-Path -LiteralPath $RunDirectory)
+        $RunArtifactsDirectory = Join-Path $RunDirectory "artifacts"
+        [void][System.IO.Directory]::CreateDirectory($RunArtifactsDirectory)
+        $RunStatePath = Join-Path $RunDirectory "state.json"
+        $TrajectoryPath = Join-Path $RunDirectory "trajectory.jsonl"
+        $RunSummaryPath = Join-Path $RunDirectory "summary.txt"
+        $initialFingerprint = & $getFingerprint
+        $RunState = New-InitialRunState `
+            -RunId $RunId `
+            -ProjectName $ProjectName `
+            -TaskPath $TaskRelativePath `
+            -TaskSha256 (Get-RunFileSha256 $TaskFullPath) `
+            -ConfigPath (Get-ProjectRelativePath $ConfigFile) `
+            -ConfigSha256 (Get-RunFileSha256 $ConfigFile) `
+            -InitialBranch $InitialBranch `
+            -InitialHead $InitialCommit `
+            -WorkspaceFingerprint $initialFingerprint.Hash `
+            -MaxAttempts $EffectiveMaxAttempts `
+            -MaxReviewCycles $EffectiveMaxReviewCycles `
+            -MaxReviewerAttempts $EffectiveMaxReviewerAttempts `
+            -ReviewerEnabled $ReviewerEnabled `
+            -CleanupEnabled $CleanupEnabled
+        $RunContext = @{
+            ProjectRoot = $ProjectRoot
+            RunDirectory = $RunDirectory
+            StatePath = $RunStatePath
+            TrajectoryPath = $TrajectoryPath
+        }
+        [void](Initialize-PersistentRun $RunContext $RunState)
+    }
+    else {
+        [void][System.IO.Directory]::CreateDirectory($RunArtifactsDirectory)
+        $RunContext = @{
+            ProjectRoot = $ProjectRoot
+            RunDirectory = $RunDirectory
+            StatePath = $RunStatePath
+            TrajectoryPath = $TrajectoryPath
+        }
+        $RunState = Open-PersistentRunForResume `
+            -RunContext $RunContext `
+            -ExpectedRunId $RunId `
+            -ExpectedProjectName $ProjectName `
+            -ConfigPath $ConfigFile `
+            -GetWorkspaceFingerprint $getFingerprint
+        $InitialBranch = [string]$RunState.Git.InitialBranch
+        $InitialCommit = [string]$RunState.Git.InitialHead
+        $StartTime = [DateTimeOffset]::Parse([string]$RunState.CreatedAt).LocalDateTime
+    }
+    $ReportDirectory = $RunArtifactsDirectory
+    $script:AgentSequence = [int]$RunState.Counters.DeveloperAttempts +
+        [int]$RunState.Counters.ReviewerAttempts
+
+    $stageCallback = {
         param($context)
 
-        switch ([string]$context.Action) {
-            "development" {
+        if ([string]$context.Stage -in @("development", "repair")) {
+            if ([string]$context.Stage -eq "development") {
                 $prompt = New-DevelopmentPrompt
                 $invocationType = "development"
             }
-            "validation_repair" {
+            elseif ([string]$context.RepairKind -eq "validation") {
                 $prompt = New-ValidationRepairPrompt `
-                    -RepairNumber ([int]$context.DeveloperAttempt - 1) `
-                    -ValidationReport ([string]$context.ValidationReport) `
+                    -RepairNumber ([int]$context.Attempt - 1) `
+                    -ValidationReport (Read-RunArtifactText $context.LastValidationArtifact) `
                     -GitChanges (Get-GitChangeText)
                 $invocationType = "repair"
             }
-            "review_repair" {
+            elseif ([string]$context.RepairKind -eq "review") {
+                $reviewPath = Join-Path $RunDirectory ([string]$context.LastReviewArtifact)
+                $reviewResult = Read-ReviewContractJson $reviewPath "Review Result"
                 $prompt = New-ReviewRepairPrompt `
-                    -ReviewRepairCycle ([int]$context.ReviewRepairCycle) `
-                    -ValidationReport ([string]$context.ValidationReport) `
-                    -ReviewResult $context.ReviewResult `
+                    -ReviewRepairCycle ([int]$context.ReviewCycle) `
+                    -ValidationReport (Read-RunArtifactText $context.LastValidationArtifact) `
+                    -ReviewResult $reviewResult `
                     -GitChanges (Get-GitChangeText)
                 $invocationType = "repair"
             }
-            default {
-                throw ("Unsupported Developer action: " + $context.Action)
-            }
-        }
-
-        $agentRecord = Invoke-NextAgentAttempt `
-            -AgentProfile $DeveloperProfile `
-            -Role "Developer" `
-            -InvocationType $invocationType `
-            -Prompt $prompt
-        Assert-GitIdentityUnchanged
-        if (-not $agentRecord.ContractValid) {
+            else { throw "Unsupported persisted RepairKind." }
+            $prompt = Add-InterruptedContinuationInstructions `
+                -Prompt $prompt `
+                -InterruptedStage $context.InterruptedStage `
+                -WorkspaceChanged ([bool]$context.InterruptedWorkspaceChanged)
+            $started = Get-Date
+            $agentRecord = Invoke-NextAgentAttempt `
+                -AgentProfile $DeveloperProfile `
+                -Role "Developer" `
+                -InvocationType $invocationType `
+                -Prompt $prompt
+            Assert-GitIdentityUnchanged
+            $succeeded = $agentRecord.ContractValid -and $agentRecord.ExitCode -eq 0
+            $message = $(if ($succeeded) {
+                "Developer Agent completed."
+            } elseif (-not $agentRecord.ContractValid) {
+                "Developer Agent Contract violation: " + $agentRecord.ContractError
+            } else { "Developer Agent exit code: " + $agentRecord.ExitCode })
             return [PSCustomObject]@{
-                Succeeded = $false
-                FailureReason = (
-                    "Developer Agent violated the Agent Contract: " +
-                    $agentRecord.ContractError
-                )
+                Succeeded = $succeeded
+                Message = $message
+                DurationMs = [int64]((Get-Date) - $started).TotalMilliseconds
+                Runtime = $DeveloperProfile.Runtime
+                RequestedModel = $DeveloperProfile.Model
+                ResolvedModel = $agentRecord.ResolvedModelValue
+                Artifacts = [PSCustomObject]@{
+                    AgentRequest = Convert-ProjectArtifactToRunRelative $agentRecord.RequestPath
+                    AgentResult = Convert-ProjectArtifactToRunRelative $agentRecord.ResultPath
+                    AgentPrompt = Convert-ProjectArtifactToRunRelative $agentRecord.PromptPath
+                    Stdout = Convert-ProjectArtifactToRunRelative $agentRecord.StdoutPath
+                    Stderr = Convert-ProjectArtifactToRunRelative $agentRecord.StderrPath
+                    AgentLog = Convert-ProjectArtifactToRunRelative $agentRecord.LogPath
+                }
             }
         }
-        if ($agentRecord.ExitCode -ne 0) {
+
+        if ([string]$context.Stage -eq "validation") {
+            $validationResult = Invoke-ValidationAttempt -Attempt ([int]$context.Attempt)
+            Assert-GitIdentityUnchanged
+            $validationFingerprint = & $getFingerprint
+            if ([string]$validationFingerprint.Hash -ne
+                [string]$RunState.PendingStage.StartWorkspaceFingerprint) {
+                throw "Validation changed the project workspace."
+            }
+            $snapshot = Save-ValidationSnapshot -Attempt ([int]$context.Attempt)
+            $passed = ($validationResult.ExitCode -eq 0)
+            $resultText = $(if ($passed) { "PASSED" } else { "FAILED" })
+            $message = $(if ($passed) { "Validation passed." } else {
+                "Validation returned exit code " + $validationResult.ExitCode
+            })
+            $script:ValidationRecords += [PSCustomObject]@{
+                Attempt = [int]$context.Attempt
+                Started = $validationResult.Started
+                Finished = $validationResult.Finished
+                ExitCode = [int]$validationResult.ExitCode
+                Result = $resultText
+                SnapshotPath = $snapshot.RelativePath
+            }
+            $artifact = Convert-ProjectArtifactToRunRelative $snapshot.RelativePath
             return [PSCustomObject]@{
-                Succeeded = $false
-                FailureReason = (
-                    "Developer Agent returned exit code " + $agentRecord.ExitCode
-                )
+                Passed = $passed
+                Message = $message
+                ArtifactPath = $artifact
+                DurationMs = [int64]($validationResult.Finished - $validationResult.Started).TotalMilliseconds
+                Artifacts = [PSCustomObject]@{ ValidationReport = $artifact }
             }
         }
-        return [PSCustomObject]@{ Succeeded = $true; FailureReason = "" }
+
+        if ([string]$context.Stage -eq "review") {
+            $started = Get-Date
+            $review = Invoke-ReviewerGateAttempt `
+                -ReviewSequence ([int]$context.ReviewSequence) `
+                -ReviewerTechnicalAttempt ([int]$context.ReviewerTechnicalAttempt) `
+                -ValidationReport (Read-RunArtifactText $context.LastValidationArtifact)
+            $message = [string]$review.FailureReason
+            if ($review.TechnicalSucceeded) { $message = "Review " + $review.Verdict }
+            $artifact = $null
+            $artifacts = [PSCustomObject]@{}
+            $findingCount = $null
+            if ($review.TechnicalSucceeded) {
+                $record = $script:ReviewRecords[-1]
+                $artifact = Convert-ProjectArtifactToRunRelative $record.ResultPath
+                $artifacts = [PSCustomObject]@{ ReviewResult = $artifact }
+                $findingCount = [int]$record.TotalFindingCount
+            }
+            return [PSCustomObject]@{
+                TechnicalSucceeded = [bool]$review.TechnicalSucceeded
+                Fatal = [bool]$review.Fatal
+                Verdict = $review.Verdict
+                Message = $message
+                ArtifactPath = $artifact
+                FindingCount = $findingCount
+                DurationMs = [int64]((Get-Date) - $started).TotalMilliseconds
+                Runtime = $ReviewerProfile.Runtime
+                RequestedModel = $ReviewerProfile.Model
+                ResolvedModel = $null
+                Artifacts = $artifacts
+            }
+        }
+
+        if ([string]$context.Stage -eq "cleanup") {
+            $CleanupAttempted = $true
+            $started = Get-Date
+            $cleanupResult = Invoke-CleanupAdapter
+            $CleanupExitCode = $cleanupResult.ExitCode
+            $CleanupOutput = $cleanupResult.Output
+            Assert-GitIdentityUnchanged
+            $cleanupFingerprint = & $getFingerprint
+            if ([string]$cleanupFingerprint.Hash -ne
+                [string]$RunState.PendingStage.StartWorkspaceFingerprint) {
+                throw "Cleanup changed the project workspace."
+            }
+            return [PSCustomObject]@{
+                Passed = ($CleanupExitCode -eq 0)
+                Message = $(if ($CleanupExitCode -eq 0) {
+                    "Cleanup passed."
+                } else { "Cleanup exit code: " + $CleanupExitCode })
+                DurationMs = [int64]((Get-Date) - $started).TotalMilliseconds
+                Artifacts = [PSCustomObject]@{}
+            }
+        }
+        throw ("Unsupported persistent stage: " + $context.Stage)
     }
 
-    $validationCallback = {
-        param($context)
-
-        $validationResult = Invoke-ValidationAttempt `
-            -Attempt ([int]$context.DeveloperAttempt)
-        Assert-GitIdentityUnchanged
-        $snapshot = Save-ValidationSnapshot `
-            -Attempt ([int]$context.DeveloperAttempt)
-        if ($validationResult.ExitCode -eq 0) {
-            $resultText = "PASSED"
-            $failure = ""
-        }
-        else {
-            $resultText = "FAILED"
-            $failure = (
-                "Validation attempt {0:D2} returned exit code {1}." -f `
-                    [int]$context.DeveloperAttempt,
-                    $validationResult.ExitCode
-            )
-        }
-        $script:ValidationRecords += [PSCustomObject]@{
-            Attempt = [int]$context.DeveloperAttempt
-            Started = $validationResult.Started
-            Finished = $validationResult.Finished
-            ExitCode = [int]$validationResult.ExitCode
-            Result = $resultText
-            SnapshotPath = $snapshot.RelativePath
-        }
-        return [PSCustomObject]@{
-            Passed = ($validationResult.ExitCode -eq 0)
-            Report = $snapshot.Text
-            FailureReason = $failure
-        }
+    $RunState = Invoke-PersistentRunWorkflow `
+        -RunContext $RunContext `
+        -State $RunState `
+        -GetWorkspaceFingerprint $getFingerprint `
+        -InvokeExternalStage $stageCallback
+    $ValidationGateStatus = [string]$RunState.Gates.Validation
+    $ReviewGateStatus = [string]$RunState.Gates.Review
+    $CleanupGateStatus = [string]$RunState.Gates.Cleanup
+    $WorkflowPassed = ([string]$RunState.Status -eq "completed")
+    if ($CleanupGateStatus -eq "DISABLED") {
+        $CleanupExitCode = 0
+        $CleanupOutput = "(disabled by Project Config)"
     }
-
-    $reviewerCallback = {
-        param($context)
-
-        return Invoke-ReviewerGateAttempt `
-            -ReviewSequence ([int]$context.ReviewSequence) `
-            -ReviewerTechnicalAttempt ([int]$context.ReviewerTechnicalAttempt) `
-            -ValidationReport ([string]$context.ValidationReport)
+    if ($null -ne $RunState.Failure) {
+        $FailureReason = [string]$RunState.Failure.Message
     }
-
-    $gateResult = Invoke-ReviewGateWorkflow `
-        -MaxDeveloperAttempts $EffectiveMaxAttempts `
-        -MaxReviewCycles $EffectiveMaxReviewCycles `
-        -MaxReviewerAttempts $EffectiveMaxReviewerAttempts `
-        -ReviewerEnabled $ReviewerEnabled `
-        -InvokeDeveloper $developerCallback `
-        -InvokeValidation $validationCallback `
-        -InvokeReviewer $reviewerCallback
-
-    $ValidationGateStatus = [string]$gateResult.ValidationGate
-    $ReviewGateStatus = [string]$gateResult.ReviewGate
-    $WorkflowPassed = [bool]$gateResult.Passed
-    $FailureReason = [string]$gateResult.FailureReason
 }
 catch {
     $WorkflowPassed = $false
@@ -1395,40 +1687,6 @@ catch {
     Write-Host ("Autonomous task error: " + $_.Exception.Message)
 }
 finally {
-    if ($CleanupConfigured) {
-        if ($CleanupEnabled) {
-            $CleanupAttempted = $true
-            Write-Host "Running Cleanup Adapter."
-            try {
-                $cleanupResult = Invoke-CleanupAdapter
-                $CleanupExitCode = $cleanupResult.ExitCode
-                $CleanupOutput = $cleanupResult.Output
-                if ($CleanupExitCode -ne 0) {
-                    $CleanupGateStatus = "FAILED"
-                    $WorkflowPassed = $false
-                    Add-FailureReason (
-                        "Cleanup Adapter returned exit code " + $CleanupExitCode
-                    )
-                }
-                else {
-                    $CleanupGateStatus = "PASSED"
-                }
-            }
-            catch {
-                $CleanupExitCode = -1
-                $CleanupOutput = $_.Exception.Message
-                $CleanupGateStatus = "FAILED"
-                $WorkflowPassed = $false
-                Add-FailureReason ("Cleanup Adapter failed: " + $_.Exception.Message)
-            }
-        }
-        else {
-            $CleanupExitCode = 0
-            $CleanupOutput = "(disabled by Project Config)"
-            $CleanupGateStatus = "DISABLED"
-        }
-    }
-
     if ($InitialBranch -ne "(not recorded)" -and
         $InitialCommit -ne "(not recorded)") {
         try {
@@ -1456,6 +1714,7 @@ if ($InitialBranch -ne "(not recorded)") {
 if ($ReportsEnabled) {
     try {
         [void][System.IO.Directory]::CreateDirectory($ReportDirectory)
+        Write-RunSummary
         Add-AutonomousReportContent
         Write-Utf8File `
             -Path $AutonomousReportPath `

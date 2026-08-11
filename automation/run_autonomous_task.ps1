@@ -1,9 +1,14 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = "New")]
     [ValidateNotNullOrEmpty()]
     [string]$TaskFile,
 
+    [Parameter(Mandatory = $true, ParameterSetName = "Resume")]
+    [ValidateNotNullOrEmpty()]
+    [string]$ResumeRunId,
+
+    [Parameter(ParameterSetName = "New")]
     [ValidateRange(1, 5)]
     [int]$MaxAttempts
 )
@@ -22,9 +27,15 @@ $coreScript = [System.IO.Path]::GetFullPath(
 $invokeParameters = @{
     ProjectRoot = $projectRoot
     ConfigFile = $configFile
-    TaskFile = $TaskFile
 }
-if ($PSBoundParameters.ContainsKey("MaxAttempts")) {
+if ($PSCmdlet.ParameterSetName -eq "Resume") {
+    $invokeParameters.ResumeRunId = $ResumeRunId
+}
+else {
+    $invokeParameters.TaskFile = $TaskFile
+}
+if ($PSCmdlet.ParameterSetName -eq "New" -and
+    $PSBoundParameters.ContainsKey("MaxAttempts")) {
     $invokeParameters.MaxAttempts = $MaxAttempts
 }
 

@@ -29,3 +29,7 @@ automation/reports/current-*
 
 automation/reports/validation-latest.txt
 automation/reports/autonomous-latest.txt
+
+# Persistent autonomous Run state and artifacts
+automation/runs/**
+automation/tests/.tmp-*

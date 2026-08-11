@@ -53,6 +53,10 @@
         AutonomousLatest = "automation/reports/autonomous-latest.txt"
     }
 
+    Runs = @{
+        Directory = "automation/runs"
+    }
+
     Defaults = @{
         MaxAttempts = 3
         MaxReviewCycles = 2
