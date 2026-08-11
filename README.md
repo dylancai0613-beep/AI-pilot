@@ -1,4 +1,4 @@
-﻿# Travel Cost Pilot
+﻿# AI coding Pilot
 
 这是一个独立的自动化开发试验项目，用于验证：
 
